@@ -29,10 +29,11 @@
  * Version: $Id$
  */
 
-#include "extension.h"
-
 #include <libgearman-1.0/gearman.h>
 #include <string.h>
+
+#include "extension.h"
+#include "worker.h"
 
 /**
  * @file extension.cpp
@@ -43,25 +44,7 @@ Gearman g_Gearman;		/**< Global singleton for extension's main interface */
 
 SMEXT_LINK(&g_Gearman);
 
-void Gearman::OnHandleDestroy(HandleType_t type, void *object) {
-	g_pSM->LogMessage(myself, "Destroying handle...");
-	if(object != NULL) {
-		if(type == gearmanClientHandleType) {
-			g_pSM->LogMessage(myself, "Destroy handle type client");
-			gearman_client_free(((gearman_client_ctx *) object)->client);
-		} else if(type == gearmanWorkerHandleType) {
-			g_pSM->LogMessage(myself, "Destroy handle type worker");
-			gearman_worker_free((gearman_worker_st *) object);
-		} else if(type == gearmanJobHandleType) {
-			g_pSM->LogMessage(myself, "Destroy handle type job");
-			gearman_job_free((gearman_job_st *) object);
-		} else if(type == gearmanTaskHandleType) {
-			gearman_task_ctx *ctx = (gearman_task_ctx *) object;
-			g_pSM->LogMessage(myself, "Destroy handle type task");
-			gearman_task_free(ctx->task);
-		}
-	}
-}
+IThreader *g_pThreader = NULL;
  
 bool Gearman::SDK_OnLoad(char *error, size_t err_max, bool late) {
 	sharesys->AddNatives(myself, GearmanNatives);
@@ -81,6 +64,47 @@ void Gearman::SDK_OnUnload() {
 	g_pHandleSys->RemoveType(g_Gearman.gearmanTaskHandleType, NULL);
 }
 
+bool Gearman::QueryRunning(char* error, size_t maxlength) {
+	SM_CHECK_IFACE(THREADER, g_pThreader);
+	return true;
+}
+
+void Gearman::SDK_OnAllLoaded() {
+	SM_GET_LATE_IFACE(THREADER, g_pThreader);    	
+	m_pQueueLock = g_pThreader->MakeMutex();
+}
+
+void Gearman::OnHandleDestroy(HandleType_t type, void *object) {
+	if(object != NULL) {
+		if(type == gearmanClientHandleType) {
+			gearman_client_ctx *ctx = (gearman_client_ctx *) object;
+			if(ctx->client != NULL)
+				gearman_client_free(ctx->client);
+			// The worker with run_tasks might still be using this.
+			ctx->client = NULL;
+			
+			free(ctx);
+		} else if(type == gearmanWorkerHandleType) {
+			gearman_worker_ctx *ctx = (gearman_worker_ctx *) object;
+			if(ctx->worker != NULL)
+				gearman_worker_free(ctx->worker);
+			// GearmanWorkerThread might be attempting to use this, not sure if _free sets it to 0
+			ctx->worker = NULL;
+
+			free(ctx);
+		} else if(type == gearmanJobHandleType) {
+			gearman_job_free((gearman_job_st *) object);
+		} else if(type == gearmanTaskHandleType) {
+			gearman_task_ctx *ctx = (gearman_task_ctx *) object;
+			if(ctx->task != NULL)
+				gearman_task_free(ctx->task);
+			// I have no idea if anything uses this still.
+			ctx->task = NULL;
+			free(ctx);
+		}
+	}
+}
+
 // Getters for handles
 
 gearman_client_ctx* Gearman::GetGearmanClientInstanceByHandle(Handle_t handle) {
@@ -96,12 +120,12 @@ gearman_client_ctx* Gearman::GetGearmanClientInstanceByHandle(Handle_t handle) {
 	return client;
 }
 
-gearman_worker_st* Gearman::GetGearmanWorkerInstanceByHandle(Handle_t handle) {
+gearman_worker_ctx* Gearman::GetGearmanWorkerInstanceByHandle(Handle_t handle) {
 	HandleSecurity sec;
 	sec.pOwner = NULL;
 	sec.pIdentity = myself->GetIdentity();
 	
-	gearman_worker_st *worker;
+	gearman_worker_ctx *worker;
 
 	if (g_pHandleSys->ReadHandle(handle, g_Gearman.gearmanWorkerHandleType, &sec, (void**) &worker) != HandleError_None)
 		return NULL;
@@ -232,14 +256,27 @@ static gearman_return_t Gearman_TaskCompleteFn(gearman_task_st *task) {
 	if(pFunction == NULL)
 		return GEARMAN_SUCCESS;
 
+	// A failed attempt at attempting to find WHY there is extra data...
+	const char *data = (char *) gearman_task_data(task);
+
+	const int dataSize = gearman_task_data_size(task);
+
+	char *newData = strdup(data);
+	newData[dataSize] = '\0';
+
+	g_pSM->LogMessage(myself, "Got data %s", data);
+
 	pFunction->PushCell(ctx->hndl);
-	pFunction->PushString((char *) gearman_task_data(task));
-	pFunction->PushCell(gearman_task_data_size(task));
+	pFunction->PushString(newData);
+	pFunction->PushCell(dataSize);
 
 	cell_t result = 0;
 	pFunction->Execute(&result);
 
 	g_pHandleSys->FreeHandle(ctx->hndl, NULL);
+	ctx->hndl = NULL;
+
+	free(newData);
 
 	return GEARMAN_SUCCESS;
 }
@@ -349,10 +386,47 @@ cell_t GearmanClient_AddTask(IPluginContext *pContext, const cell_t *params) {
 
 	task->hndl = g_pHandleSys->CreateHandle(g_Gearman.gearmanTaskHandleType, task, pContext->GetIdentity(), myself->GetIdentity(), NULL);
 
-	// MAJOR TODO! This MIGHT need to be threaded
-	gearman_client_run_tasks(client->client);
+	g_Gearman.AddToQueue(task);
 	
 	return task->hndl;
+}
+
+// native GearmanClient_DoBackground(Handle:gearman, const String:function[], const String:workload[], GearmanPriority:priority=Gearman_PriorityNormal, const String:unique[] = "");
+cell_t GearmanClient_DoBackground(IPluginContext *pContext, const cell_t *params) {
+	gearman_client_ctx *client = g_Gearman.GetGearmanClientInstanceByHandle(static_cast<Handle_t>(params[1]));
+
+	if(client == NULL)
+		return pContext->ThrowNativeError("Invalid gearman handle: %i", params[1]);
+	
+	char *functionName = NULL;
+	char *argument = NULL;
+	
+	pContext->LocalToString(params[2], &functionName);
+	pContext->LocalToString(params[3], &argument);
+	
+	GearmanPriority prio = (GearmanPriority) params[4];
+	
+	gearman_return_t ret = GEARMAN_FAIL;
+
+	gearman_job_handle_t job_handle;
+
+	switch(prio) {
+	case GearmanPriority_Low:
+		ret = gearman_client_do_low_background(client->client, functionName, "", argument, strlen(argument), job_handle);
+		break;
+	case GearmanPriority_Normal:
+		ret = gearman_client_do_background(client->client, functionName, "", argument, strlen(argument), job_handle);
+		break;
+	case GearmanPriority_High:
+		ret = gearman_client_do_high_background(client->client, functionName, "", argument, strlen(argument), job_handle);
+		break;
+	}
+
+	if(ret != GEARMAN_SUCCESS) {
+		return BAD_HANDLE;
+	}
+
+	return g_pHandleSys->CreateHandle(g_Gearman.gearmanJobHandleType, job_handle, pContext->GetIdentity(), myself->GetIdentity(), NULL);
 }
 
 // native GearmanClient_SetCreatedCallback(Handle:gearman, GearmanCreatedCallback:callback);
@@ -366,7 +440,6 @@ cell_t GearmanClient_SetCreatedCallback(IPluginContext *pContext, const cell_t *
 	return true;
 }
 
-
 // native GearmanWorker_Create()
 cell_t GearmanWorker_Create(IPluginContext *pContext, const cell_t *params) {
 	gearman_worker_st *worker = gearman_worker_create(NULL);
@@ -374,14 +447,19 @@ cell_t GearmanWorker_Create(IPluginContext *pContext, const cell_t *params) {
 	if(worker == NULL)
 		return BAD_HANDLE;
 
+	gearman_worker_ctx *ctx = new gearman_worker_ctx;
+	ctx->pContext = pContext;
+	ctx->worker = worker;
+	ctx->thread = NULL;
+
 	// Return the handle
-	return g_pHandleSys->CreateHandle(g_Gearman.gearmanWorkerHandleType, worker, pContext->GetIdentity(), myself->GetIdentity(), NULL);
+	return g_pHandleSys->CreateHandle(g_Gearman.gearmanWorkerHandleType, ctx, pContext->GetIdentity(), myself->GetIdentity(), NULL);
 }
 
 // native GearmanWorker_AddServer(Handle:gearman, const String:address[], port);
 cell_t GearmanWorker_AddServer(IPluginContext *pContext, const cell_t *params) {
-	gearman_worker_st *worker = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
-	if(worker == NULL)
+	gearman_worker_ctx *ctx = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
+	if(ctx == NULL)
 		return pContext->ThrowNativeError("Invalid gearman handle: %i", params[1]);
 	if (params[3] < 0 || params[3] > 65535)
 		return pContext->ThrowNativeError("Invalid port specified");
@@ -389,51 +467,78 @@ cell_t GearmanWorker_AddServer(IPluginContext *pContext, const cell_t *params) {
 	char *hostname = NULL;
 	pContext->LocalToString(params[2], &hostname);
 	
-	return gearman_worker_add_server(worker, hostname, params[3]);
+	return gearman_worker_add_server(ctx->worker, hostname, params[3]);
 }
 
-// native GearmanWorker_AddFunction(Handle:gearman, const String:functionName[], GearmanWorker:worker);
+// native GearmanWorker_AddFunction(Handle:gearman, const String:functionName[], GearmanWorker:worker, timeout = 0);
 cell_t GearmanWorker_AddFunction(IPluginContext *pContext, const cell_t *params) {
-	gearman_worker_st *worker = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
+	gearman_worker_ctx *ctx = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
 
-	if(worker == NULL)
-		return pContext->ThrowNativeError("Invalid worker handle: %i", params[1]);
-	
+	if(ctx == NULL) {
+		pContext->ThrowNativeError("Invalid worker handle: %i", params[1]);
+		return GEARMAN_FAIL;
+	}
+
 	char *funcName = NULL;
 	pContext->LocalToString(params[2], &funcName);
 	
 	gearman_worker_cb *context = new gearman_worker_cb;
 	context->pContext = pContext;
-	context->funcid = params[3];
+	context->funcid = static_cast<funcid_t>(params[3]);
+
+	int timeout = params[4];
 
 	g_pSM->LogMessage(myself, "Worker registered for %s", funcName);
-	return gearman_worker_add_function(worker, funcName, 60000, Gearman_CallWorker, context);
+	gearman_return_t ret;// = gearman_worker_add_function(ctx->worker, funcName, timeout, Gearman_CallWorker, context);
+	gearman_function_t func = gearman_function_create(Gearman_CallWorker);
+
+	ret = gearman_worker_define_function(ctx->worker, funcName, strlen(funcName), func, timeout, context);
+
+	// This needs a thread to call gearman_worker_work for 'worker', one thread per worker.
+	if(ret == GEARMAN_SUCCESS && ctx->thread == NULL) {
+		g_pSM->LogMessage(myself, "Creating thread...");
+		ctx->thread = new GearmanWorkerThread(ctx);
+
+		ThreadParams threadparams;
+		threadparams.flags = Thread_AutoRelease;
+		threadparams.prio = ThreadPrio_Low;
+
+		IThreadHandle *handle = g_pThreader->MakeThread(ctx->thread, &threadparams);
+		if(handle == NULL) {
+			pContext->ThrowNativeError("Failed to add function, unable to start worker thread.");
+			return GEARMAN_FAIL;
+		}
+	}
+	return ret;
 }
 
-void* Gearman_CallWorker(gearman_job_st *job, void *context, size_t *result_size, gearman_return_t *ret_ptr) {
+gearman_return_t Gearman_CallWorker(gearman_job_st *job, void *context) {
 	g_pSM->LogMessage(myself, "Worker called");
 
 	gearman_worker_cb * worker_cb = (gearman_worker_cb *) context;
 
 	if(worker_cb == NULL)
-		return 0;
+		return GEARMAN_FAIL;
 	
 	Handle_t job_hndl = g_pHandleSys->CreateHandle(g_Gearman.gearmanJobHandleType, job, worker_cb->pContext->GetIdentity(), myself->GetIdentity(), NULL);
 	
 	IPluginFunction *pFunction = worker_cb->pContext->GetFunctionById(worker_cb->funcid);
 
 	if(pFunction == NULL)
-		return 0;
+		return GEARMAN_FAIL;
 		
-		
-	char *workload = NULL;
-	workload = (char *) gearman_job_workload(job);
+	const char *workload = (char *) gearman_job_workload(job);
+
+	const size_t workloadSize = gearman_job_workload_size(job);
+
+	//char *newWorkload = strdup(workload);
+	//newWorkload[workloadSize] = '\0';
 
 	// GearmanWorker(Handle:job, const String:workload[], const workloadSize)
 	// Push the job handle
 	pFunction->PushCell(job_hndl);
 	pFunction->PushString(workload);
-	pFunction->PushCell(gearman_job_workload_size(job));
+	pFunction->PushCell(workloadSize);
 
 	cell_t result = 0;
 	pFunction->Execute(&result);
@@ -442,27 +547,25 @@ void* Gearman_CallWorker(gearman_job_st *job, void *context, size_t *result_size
 	sec.pOwner = NULL;
 	sec.pIdentity = myself->GetIdentity();
 	g_pHandleSys->FreeHandle(job_hndl, &sec);
-	
-	gearman_job_free(job);
 
-	return 0;
+	return static_cast<gearman_return_t>(result);
 }
 
 cell_t GearmanWorker_SetIdentifier(IPluginContext *pContext, const cell_t *params) {
-	gearman_worker_st *worker = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
+	gearman_worker_ctx *ctx = g_Gearman.GetGearmanWorkerInstanceByHandle(static_cast<Handle_t>(params[1]));
 
-	if(worker == NULL)
+	if(ctx == NULL)
 		return pContext->ThrowNativeError("Invalid worker handle: %i", params[1]);
 	
 	char *identifier = NULL;
 	pContext->LocalToString(params[2], &identifier);
 	
-	return gearman_worker_set_identifier(worker, identifier, strlen(identifier));
+	return gearman_worker_set_identifier(ctx->worker, identifier, strlen(identifier));
 }
 
 /* Gearman Job Functions */
 
-// native GearmanJob_Send(Handle:job, const String:data[], const dataLength, GearmanResp:type=GearmanResp_Data)
+// native GearmanJob_Send(Handle:job, const String:data[], GearmanResp:type=GearmanResp_Data)
 cell_t GearmanJob_Send(IPluginContext *pContext, const cell_t *params) {
 	gearman_job_st *job = g_Gearman.GetGearmanJobInstanceByHandle(static_cast<Handle_t>(params[1]));
 	if(job == NULL)
@@ -470,23 +573,25 @@ cell_t GearmanJob_Send(IPluginContext *pContext, const cell_t *params) {
 	
 	char *data = NULL;
 	pContext->LocalToString(params[2], &data);
+
+	const size_t dataSize = strlen(data);
 	
-	GearmanResp type = (GearmanResp) params[4];
+	GearmanResp type = (GearmanResp) params[3];
 	
 	gearman_return_t ret;
 	
 	switch(type) {
 		case GearmanResp_Data:
-			ret = gearman_job_send_data(job, data, params[3]);
+			ret = gearman_job_send_data(job, data, dataSize);
 			break;
 		case GearmanResp_Warning:
-			ret = gearman_job_send_warning(job, data, params[3]);
+			ret = gearman_job_send_warning(job, data, dataSize);
 			break;
 		case GearmanResp_Complete:
-			ret = gearman_job_send_complete(job, data, params[3]);
+			ret = gearman_job_send_complete(job, data, dataSize);
 			break;
 		case GearmanResp_Exception:
-			ret = gearman_job_send_exception(job, data, params[3]);
+			ret = gearman_job_send_exception(job, data, dataSize);
 			break;
 	}
 	return ret;
@@ -610,6 +715,85 @@ cell_t GearmanTask_SetWarningCallback(IPluginContext *pContext, const cell_t *pa
 	ctx->warningfunc = static_cast<funcid_t>(params[2]);
 
 	return true;
+}
+
+// Workers for client
+
+void Gearman::OnWorkerStart(IThreadWorker *pWorker) {
+}
+
+void Gearman::OnWorkerStop(IThreadWorker *pWorker) {
+}
+
+static bool s_OneTimeThreaderErrorMsg = false;
+
+bool Gearman::AddToQueue(gearman_task_ctx *ctx) {
+	if (!m_pWorker) {
+		m_pWorker = g_pThreader->MakeWorker(this, true);
+		if (!m_pWorker) {
+			if (!s_OneTimeThreaderErrorMsg) {
+				g_pSM->LogError(myself, "[SM] Unable to create gearman threader (error unknown)");
+				s_OneTimeThreaderErrorMsg = true;
+			}
+			return false;
+		}
+		if (!m_pWorker->Start()) {
+			if (!s_OneTimeThreaderErrorMsg) {
+				g_pSM->LogError(myself, "[SM] Unable to start gearman threader (error unknown)");
+				s_OneTimeThreaderErrorMsg = true;
+			}
+			g_pThreader->DestroyWorker(m_pWorker);
+			m_pWorker = NULL;
+			return false;
+		}
+	}
+
+	/* Add to the queue */
+	{
+		m_pQueueLock->Lock();
+		if(!m_TaskQueue.empty()) {
+			m_pQueueLock->Unlock();
+			return true;
+		}
+		m_TaskQueue.push(ctx);
+		m_pQueueLock->Unlock();
+	}
+
+	/* Make the thread */
+	m_pWorker->MakeThread(this);
+	return true;
+}
+
+void Gearman::RunThread(IThreadHandle *pThread) {
+	gearman_task_ctx *ctx = NULL;
+
+	{
+		m_pQueueLock->Lock();
+		if (!m_TaskQueue.empty()) {
+			ctx = m_TaskQueue.first();
+			m_TaskQueue.pop();
+		}
+		m_pQueueLock->Unlock();
+	}
+
+	if (!ctx) {
+		return;
+	}
+
+	gearman_return_t ret = gearman_client_run_tasks(ctx->cContext->client);
+	// TODO use ret
+}
+
+void Gearman::OnTerminate(IThreadHandle *pThread, bool cancel) {
+}
+
+void Gearman::KillWorkerThread() {
+	if (m_pWorker) {
+		m_pWorker->Stop(false);
+		g_pThreader->DestroyWorker(m_pWorker);
+		m_pWorker = NULL;
+		s_OneTimeThreaderErrorMsg = false;
+	}
 }
 
 const sp_nativeinfo_t GearmanNatives[] = {

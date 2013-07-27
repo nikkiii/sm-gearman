@@ -39,7 +39,12 @@
 
 #include "smsdk_ext.h"
 
-void* Gearman_CallWorker(gearman_job_st *job, void *context, size_t *result_size, gearman_return_t *ret_ptr);
+#include <IThreader.h>
+#include <sm_queue.h>
+
+gearman_return_t Gearman_CallWorker(gearman_job_st *job, void *context);
+
+class GearmanWorkerThread;
 
 enum GearmanPriority {
 	GearmanPriority_Low,
@@ -65,6 +70,12 @@ struct gearman_client_ctx {
 	funcid_t createdFunc;
 };
 
+struct gearman_worker_ctx {
+	IPluginContext *pContext;
+	gearman_worker_st *worker;
+	GearmanWorkerThread *thread;
+};
+
 struct gearman_task_ctx {
 	IPluginContext *pContext;
 	gearman_client_ctx *cContext;
@@ -84,7 +95,11 @@ struct gearman_task_ctx {
  * @brief Sample implementation of the SDK Extension.
  * Note: Uncomment one of the pre-defined virtual functions in order to use it.
  */
-class Gearman : public SDKExtension, public IHandleTypeDispatch {
+class Gearman : public SDKExtension, public IHandleTypeDispatch, public IThread, public IThreadWorkerCallbacks {
+private:
+	Queue<gearman_task_ctx *> m_TaskQueue;
+	IMutex *m_pQueueLock;				/* Queue safety lock */
+	IThreadWorker *m_pWorker;			/* Worker thread object */
 public:
 	/**
 	 * @brief This is called after the initial loading sequence has been processed.
@@ -100,11 +115,27 @@ public:
 	 * @brief This is called right before the extension is unloaded.
 	 */
 	virtual void SDK_OnUnload();
-	
-	gearman_client_ctx* GetGearmanClientInstanceByHandle(Handle_t);
-	gearman_worker_st* GetGearmanWorkerInstanceByHandle(Handle_t);
-	gearman_job_st* GetGearmanJobInstanceByHandle(Handle_t);
 
+	/**
+	 * @brief This is called once all known extensions have been loaded.
+	 * Note: It is is a good idea to add natives here, if any are provided.
+	 */
+	virtual void SDK_OnAllLoaded();
+
+	/**
+	 * @brief this is called when Core wants to know if your extension is working.
+	 *
+	 * @param error		Error message buffer.
+	 * @param maxlength	Size of error message buffer.
+	 * @return			True if working, false otherwise.
+	 */
+	virtual bool QueryRunning(char *error, size_t maxlength);
+
+public:
+	gearman_client_ctx* GetGearmanClientInstanceByHandle(Handle_t);
+	gearman_worker_ctx* GetGearmanWorkerInstanceByHandle(Handle_t);
+
+	gearman_job_st* GetGearmanJobInstanceByHandle(Handle_t);
 	gearman_task_ctx* GetGearmanTaskCtxInstanceByHandle(Handle_t);
 	
 	HandleType_t gearmanClientHandleType;
@@ -115,8 +146,19 @@ public:
 
 	HandleType_t gearmanTaskHandleType;
 	
+	bool AddToQueue(gearman_task_ctx *ctx);
+public:
+	void RunFrame();
 public:
 	void OnHandleDestroy(HandleType_t type, void *object);
+public: //IThread
+	void RunThread(IThreadHandle *pThread);
+	void OnTerminate(IThreadHandle *pThread, bool cancel);
+public: //IThreadWorkerCallbacks
+	void OnWorkerStart(IThreadWorker *pWorker);
+	void OnWorkerStop(IThreadWorker *pWorker);
+private:
+	void KillWorkerThread();
 };
 
 extern const sp_nativeinfo_t GearmanNatives[];
