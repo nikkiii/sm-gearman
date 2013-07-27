@@ -1,6 +1,5 @@
 Currently unfinished.
 
-Things to do:
+It sort of works. The client part works, the worker part semi-works (It works for 3 times and on the fourth it times out, then works again for another 3).
 
-* Each Worker object needs it's own thread for gearman_worker_work
-* MIGHT need to use the threading setup which database connections use to call gearman_client_run_tasks on task add (It won't run them otherwise)
+It may leak memory (If you see an obvious leak, let me know in an issue), it is NOT stable (It probably will crash randomly!), dobackground is not tested and needs to be redone to not return a job handle which could be bad if left unclosed.
